@@ -1,0 +1,4 @@
+build/
+metaeditor-*.log
+*.ex4
+*.ex5

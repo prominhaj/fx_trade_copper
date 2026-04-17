@@ -12,6 +12,8 @@
 #define COMMENT_PREFIX "TC"
 #define EMPTY_BLOB "-"
 
+#include "fx_trade_copper_redis_module.mqh"
+
 enum ENUM_MODE
   {
    MODE_MASTER,
@@ -70,6 +72,23 @@ input string CopyScheduleRules = "";
 input string LotMultiplierScheduleRules = "";
 input bool AutoMapByBaseSymbol = true;
 input bool VerboseLogs = true;
+input bool EnableRedisHttpExport = false;
+input string RedisHttpBaseUrl = "";
+input string RedisHttpEndpointPath = "/api/v1/mt5/redis-sync";
+input int RedisHttpTimeoutMs = 5000;
+input int RedisHttpPublishIntervalSec = 60;
+input bool RedisHttpPublishOnTradeEvents = true;
+input string RedisHttpAuthHeaderName = "Authorization";
+input string RedisHttpAuthToken = "";
+input bool RedisHttpUseBearerToken = true;
+input bool RedisHttpAllowInsecureHttp = false;
+input bool RedisHttpIncludeOpenPositions = true;
+input bool RedisHttpIncludePendingOrders = true;
+input bool RedisHttpIncludeTradeHistory = true;
+input int RedisHttpTradeHistoryDays = 35;
+input int RedisHttpMaxDealsPerPush = 200;
+input string RedisHttpCustomFromDate = "";
+input string RedisHttpCustomToDate = "";
 
 struct SymbolMapEntry
   {
@@ -449,6 +468,7 @@ LotMultiplierScheduleRule g_lot_multiplier_schedule_rules[];
 bool g_has_copy_allow_rules=false;
 string g_last_copy_schedule_reason="";
 string g_last_lot_schedule_description="";
+CRedisHttpExporter g_redis_exporter;
 
 bool IsWhiteSpace(const int ch)
   {
@@ -494,7 +514,7 @@ string ToUpperAscii(const string value)
       int ch=StringGetCharacter(value,i);
       if(ch>='a' && ch<='z')
          ch-=32;
-      result+=CharToString((ushort)ch);
+      result+=CharToString((uchar)ch);
      }
    return result;
   }
@@ -507,9 +527,150 @@ string ReplaceString(const string value,const string search,const string replace
    while(index>=0)
      {
       result=StringSubstr(result,0,index)+replacement+StringSubstr(result,index+search_length);
-      index=StringFind(result,search,index+StringLen(replacement));
+     index=StringFind(result,search,index+StringLen(replacement));
      }
    return result;
+  }
+
+string ToLowerAscii(const string value)
+  {
+   string result="";
+   int length=StringLen(value);
+   for(int i=0;i<length;i++)
+     {
+      int ch=StringGetCharacter(value,i);
+      if(ch>='A' && ch<='Z')
+         ch+=32;
+      result+=CharToString((uchar)ch);
+     }
+   return result;
+  }
+
+bool StartsWithText(const string value,const string prefix)
+  {
+   return StringSubstr(value,0,StringLen(prefix))==prefix;
+  }
+
+string TrimTrailingSlashes(const string value)
+  {
+   string result=value;
+   while(StringLen(result)>0)
+     {
+      int ch=StringGetCharacter(result,StringLen(result)-1);
+      if(ch!='/' && ch!='\\')
+         break;
+      result=StringSubstr(result,0,StringLen(result)-1);
+     }
+   return result;
+  }
+
+string EnsureLeadingSlash(const string value)
+  {
+   if(value=="")
+      return "";
+   if(StringGetCharacter(value,0)=='/')
+      return value;
+   return "/"+value;
+  }
+
+string JoinUrl(const string base_url,const string path)
+  {
+   string trimmed_base=TrimTrailingSlashes(TrimString(base_url));
+   string normalized_path=EnsureLeadingSlash(TrimString(path));
+   if(trimmed_base=="")
+      return normalized_path;
+   if(normalized_path=="")
+      return trimmed_base;
+   return trimmed_base+normalized_path;
+  }
+
+string JsonEscape(const string value)
+  {
+   string escaped="";
+   int length=StringLen(value);
+   for(int i=0;i<length;i++)
+     {
+      int ch=StringGetCharacter(value,i);
+      if(ch=='\\')
+         escaped+="\\\\";
+      else if(ch=='\"')
+         escaped+="\\\"";
+      else if(ch=='\r')
+         escaped+="\\r";
+      else if(ch=='\n')
+         escaped+="\\n";
+      else if(ch=='\t')
+         escaped+="\\t";
+      else
+         escaped+=StringSubstr(value,i,1);
+     }
+   return escaped;
+  }
+
+string JsonString(const string value)
+  {
+   return "\""+JsonEscape(value)+"\"";
+  }
+
+string JsonBool(const bool value)
+  {
+   return value ? "true" : "false";
+  }
+
+string DateTimeToIsoText(const datetime value)
+  {
+   MqlDateTime parts={};
+   if(!TimeToStruct(value,parts))
+      return "";
+   return StringFormat("%04d-%02d-%02dT%02d:%02d:%02d",
+                       parts.year,
+                       parts.mon,
+                       parts.day,
+                       parts.hour,
+                       parts.min,
+                       parts.sec);
+  }
+
+datetime StartOfDay(const datetime value)
+  {
+   MqlDateTime parts={};
+   if(!TimeToStruct(value,parts))
+      return value;
+   parts.hour=0;
+   parts.min=0;
+   parts.sec=0;
+   return StructToTime(parts);
+  }
+
+bool ParseDateInput(const string text,const bool end_of_day,datetime &value)
+  {
+   value=0;
+   string trimmed=TrimString(text);
+   if(trimmed=="")
+      return false;
+
+   string normalized=ReplaceString(trimmed,"/","-");
+   normalized=ReplaceString(normalized,".","-");
+
+   string parts[];
+   if(StringSplit(normalized,'-',parts)!=3)
+      return false;
+
+   int year=(int)StringToInteger(parts[0]);
+   int month=(int)StringToInteger(parts[1]);
+   int day=(int)StringToInteger(parts[2]);
+   if(year<1970 || month<1 || month>12 || day<1 || day>31)
+      return false;
+
+   MqlDateTime dt={};
+   dt.year=year;
+   dt.mon=month;
+   dt.day=day;
+   dt.hour=end_of_day ? 23 : 0;
+   dt.min=end_of_day ? 59 : 0;
+   dt.sec=end_of_day ? 59 : 0;
+   value=StructToTime(dt);
+   return value>0;
   }
 
 int DayMaskForDayOfWeek(const int day_of_week)
@@ -1056,6 +1217,41 @@ bool ParseScheduleRules()
    if(!ParseLotMultiplierScheduleRules())
       return false;
    return true;
+  }
+
+void LoadRedisHttpExportConfig(RedisHttpExportConfig &config)
+  {
+   config.enabled=EnableRedisHttpExport;
+   config.base_url=RedisHttpBaseUrl;
+   config.endpoint_path=RedisHttpEndpointPath;
+   config.timeout_ms=RedisHttpTimeoutMs;
+   config.publish_interval_sec=RedisHttpPublishIntervalSec;
+   config.publish_on_trade_events=RedisHttpPublishOnTradeEvents;
+   config.auth_header_name=RedisHttpAuthHeaderName;
+   config.auth_token=RedisHttpAuthToken;
+   config.use_bearer_token=RedisHttpUseBearerToken;
+   config.allow_insecure_http=RedisHttpAllowInsecureHttp;
+   config.include_open_positions=RedisHttpIncludeOpenPositions;
+   config.include_pending_orders=RedisHttpIncludePendingOrders;
+   config.include_trade_history=RedisHttpIncludeTradeHistory;
+   config.trade_history_days=RedisHttpTradeHistoryDays;
+   config.max_deals_per_push=RedisHttpMaxDealsPerPush;
+   config.custom_from_date=RedisHttpCustomFromDate;
+   config.custom_to_date=RedisHttpCustomToDate;
+   config.verbose_logs=VerboseLogs;
+   config.log_prefix="FXTradeCopper";
+   config.ea_name="FX Trade Copper";
+   config.ea_version="3.10";
+   config.mode_name=(Mode==MODE_MASTER) ? "MASTER" : "SLAVE";
+   config.channel_id=g_channel_key;
+   config.copy_positions=CopyPositions;
+   config.copy_pending_orders=CopyPendingOrders;
+   config.copy_stop_loss=CopyStopLoss;
+   config.copy_take_profit=CopyTakeProfit;
+   config.copy_expirations=CopyExpirations;
+   config.volume_multiplier=VolumeMultiplier;
+   config.enable_slave_time_schedule=EnableSlaveTimeSchedule;
+   config.simple_lot_window=UseSimpleLotMultiplierWindow;
   }
 
 bool SlaveCopyAllowedBySchedule(string &reason)
@@ -1992,6 +2188,10 @@ int OnInit()
       return INIT_PARAMETERS_INCORRECT;
    if(!ParseScheduleRules())
       return INIT_PARAMETERS_INCORRECT;
+   RedisHttpExportConfig redis_export_config;
+   LoadRedisHttpExportConfig(redis_export_config);
+   if(!g_redis_exporter.Initialize(redis_export_config))
+      return INIT_PARAMETERS_INCORRECT;
 
    if(Mode==MODE_SLAVE)
       trade.SetExpertMagicNumber((ulong)MagicNumber);
@@ -2031,18 +2231,23 @@ void OnTimer()
       PublishMasterSnapshot();
    else
       PullSlaveSnapshot();
+   g_redis_exporter.MaybePublish();
   }
 
 void OnTrade()
   {
    if(Mode==MODE_MASTER && PublishOnTradeEvents)
       PublishMasterSnapshot();
+   if(EnableRedisHttpExport && RedisHttpPublishOnTradeEvents)
+      g_redis_exporter.QueuePublish();
   }
 
 void OnTradeTransaction(const MqlTradeTransaction &trans,const MqlTradeRequest &request,const MqlTradeResult &result)
   {
    if(Mode==MODE_MASTER && PublishOnTradeEvents)
       PublishMasterSnapshot();
+   if(EnableRedisHttpExport && RedisHttpPublishOnTradeEvents)
+      g_redis_exporter.QueuePublish();
   }
 
 void OnChartEvent(const int id,const long &lparam,const double &dparam,const string &sparam)

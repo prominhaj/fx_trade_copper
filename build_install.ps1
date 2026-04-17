@@ -5,6 +5,19 @@ param(
 $defaultSource = "fx_trade_copper.mq5"
 $workspace = (Get-Location).Path
 
+function Get-EaVersion {
+    param(
+        [string]$SourcePath
+    )
+
+    $versionLine = Select-String -Path $SourcePath -Pattern '^\s*#property\s+version\s+"([^"]+)"' | Select-Object -First 1
+    if ($versionLine -and $versionLine.Matches.Count -gt 0) {
+        return $versionLine.Matches[0].Groups[1].Value
+    }
+
+    return "unknown"
+}
+
 function Resolve-CompileSource {
     param(
         [string]$RequestedFile,
@@ -60,8 +73,23 @@ function Resolve-CompileSource {
 
 $FilePath = Resolve-CompileSource -RequestedFile $File -WorkspacePath $workspace -DefaultSourceName $defaultSource
 $expertOutputPath = [System.IO.Path]::ChangeExtension($FilePath, ".ex5")
+$sourceName = [System.IO.Path]::GetFileNameWithoutExtension($FilePath)
 $expertFileName = [System.IO.Path]::GetFileName($expertOutputPath)
 $compilePath = [string]$FilePath
+$eaVersion = Get-EaVersion -SourcePath $FilePath
+$buildRoot = Join-Path $workspace "build"
+$buildArtifactPath = Join-Path $buildRoot $expertFileName
+$buildLogPath = Join-Path $workspace ("metaeditor-" + $sourceName + ".log")
+$sourceBuildBefore = $null
+
+if (Test-Path $expertOutputPath) {
+    $sourceBuildBefore = (Get-Item $expertOutputPath).LastWriteTimeUtc
+}
+
+New-Item -ItemType Directory -Force -Path $buildRoot | Out-Null
+if (Test-Path $buildArtifactPath) {
+    Remove-Item -Path $buildArtifactPath -Force
+}
 
 # 2. Discover Terminal Path
 $appData = [Environment]::GetFolderPath("ApplicationData")
@@ -88,14 +116,39 @@ if (-not $metaEditor) {
 }
 
 Write-Host "Compiling ${compilePath}..." -ForegroundColor Cyan
+Write-Host "Build artifact will be stored in: $buildArtifactPath" -ForegroundColor DarkCyan
+Write-Host "Detected EA version: $eaVersion" -ForegroundColor DarkCyan
 
 # 3. Compile the file
-$compileArgs = @("/compile:`"$compilePath`"", "/log")
+$compileArgs = @("/compile:`"$compilePath`"", "/log:`"$buildLogPath`"")
 $process = Start-Process -FilePath $metaEditor -ArgumentList $compileArgs -Wait -NoNewWindow -PassThru
 
 # 4. Verify & Deploy
 if (Test-Path $expertOutputPath) {
+    $sourceBuildAfter = (Get-Item $expertOutputPath).LastWriteTimeUtc
+    if ($null -ne $sourceBuildBefore -and $sourceBuildAfter -le $sourceBuildBefore) {
+        Write-Host "Compilation did not produce a newer EX5 file. Build log: $buildLogPath" -ForegroundColor Red
+        exit 1
+    }
+
     Write-Host "Compilation successful!" -ForegroundColor Green
+
+    try {
+        Copy-Item -Path $expertOutputPath -Destination $buildArtifactPath -Force -ErrorAction Stop
+    }
+    catch {
+        Write-Host "Failed to copy build artifact to: $buildArtifactPath" -ForegroundColor Red
+        Write-Host $_.Exception.Message -ForegroundColor DarkRed
+        exit 1
+    }
+
+    if (-not (Test-Path $buildArtifactPath)) {
+        Write-Host "Build completed but no EX5 was generated inside build folder: $buildArtifactPath" -ForegroundColor Red
+        exit 1
+    }
+
+    Write-Host "Saved build artifact: $buildArtifactPath" -ForegroundColor Yellow
+    Write-Host "Saved build log: $buildLogPath" -ForegroundColor Yellow
     
     if (Test-Path $terminalsPath) {
         $terminals = Get-ChildItem -Path $terminalsPath -Directory
@@ -137,5 +190,6 @@ if (Test-Path $expertOutputPath) {
         Write-Host -ForegroundColor Red "Warning: MetaQuotes Terminal user path not found."
     }
 } else {
-    Write-Host "Compilation failed. A log file has been created near your mq5 script." -ForegroundColor Red
+    Write-Host "Compilation failed. Build log: $buildLogPath" -ForegroundColor Red
+    exit 1
 }

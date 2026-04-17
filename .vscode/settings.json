@@ -10,6 +10,11 @@
         "**/*.ex4": true,
         "**/*.ex5": true
     },
+    "files.watcherExclude": {
+        "**/build/**": true,
+        "**/*.ex4": true,
+        "**/*.ex5": true
+    },
     "editor.tokenColorCustomizations": {
         "textMateRules": [
             {
