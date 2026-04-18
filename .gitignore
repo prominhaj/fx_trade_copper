@@ -2,3 +2,5 @@ build/
 metaeditor-*.log
 *.ex4
 *.ex5
+redis_http_proxy/node_modules/
+redis_http_proxy/.env

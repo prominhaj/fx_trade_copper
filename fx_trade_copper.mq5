@@ -5,7 +5,7 @@
 //+------------------------------------------------------------------+
 #property copyright "Copyright 2024-2026, FX Trade Copper"
 #property link      "https://www.allanmaug.com"
-#property version   "3.10"
+#property version   "3.12"
 #property strict
 
 #define PROTOCOL_VERSION "2"
@@ -22,7 +22,8 @@ enum ENUM_MODE
 
 input ENUM_MODE Mode = MODE_SLAVE;
 input string ChannelId = "default";
-input string SymbolMappings = "XAUUSD=XAUUSD";
+input string SymbolMappings = "";
+input string CopyOnlySymbols = "";
 input int MagicNumber = 12345;
 input double VolumeMultiplier = 1.0;
 input int TimerIntervalMs = 50;
@@ -91,6 +92,17 @@ input string RedisHttpCustomFromDate = "";
 input string RedisHttpCustomToDate = "";
 
 struct SymbolMapEntry
+  {
+   string master_symbol;
+   string slave_symbol;
+  };
+
+struct SymbolFilterEntry
+  {
+   string value;
+  };
+
+struct SymbolResolutionEntry
   {
    string master_symbol;
    string slave_symbol;
@@ -452,6 +464,8 @@ public:
 
 CTradeSimple trade;
 SymbolMapEntry g_symbol_maps[];
+SymbolFilterEntry g_symbol_filters[];
+SymbolResolutionEntry g_symbol_resolution_cache[];
 string g_channel_key="";
 string g_transport_file_name="";
 string g_last_master_state="";
@@ -544,6 +558,99 @@ string ToLowerAscii(const string value)
       result+=CharToString((uchar)ch);
      }
    return result;
+  }
+
+bool IsAsciiLetterOrDigit(const int ch)
+  {
+   return (ch>='A' && ch<='Z') || (ch>='a' && ch<='z') || (ch>='0' && ch<='9');
+  }
+
+bool StringContainsDigits(const string value)
+  {
+   int length=StringLen(value);
+   for(int i=0;i<length;i++)
+     {
+      int ch=StringGetCharacter(value,i);
+      if(ch>='0' && ch<='9')
+         return true;
+     }
+   return false;
+  }
+
+bool StringsEqualIgnoreCase(const string left,const string right)
+  {
+   return ToUpperAscii(TrimString(left))==ToUpperAscii(TrimString(right));
+  }
+
+string CompactSymbolKey(const string symbol)
+  {
+   string compact="";
+   string normalized=ToUpperAscii(TrimString(symbol));
+   int length=StringLen(normalized);
+   for(int i=0;i<length;i++)
+     {
+      int ch=StringGetCharacter(normalized,i);
+      if(IsAsciiLetterOrDigit(ch))
+         compact+=CharToString((uchar)ch);
+     }
+   return compact;
+  }
+
+int ContainedSymbolScore(const string candidate_compact,const string target_compact)
+  {
+   if(candidate_compact=="" || target_compact=="")
+      return -1;
+
+   int index=StringFind(candidate_compact,target_compact,0);
+   if(index<0)
+      return -1;
+
+   string prefix=StringSubstr(candidate_compact,0,index);
+   string suffix=StringSubstr(candidate_compact,index+StringLen(target_compact));
+   if(StringContainsDigits(prefix) || StringContainsDigits(suffix))
+      return -1;
+
+   int extra_length=StringLen(prefix)+StringLen(suffix);
+   if(extra_length>12)
+      return -1;
+
+   return 500-(extra_length*10);
+  }
+
+int GetSymbolSimilarityScore(const string candidate_symbol,const string target_symbol)
+  {
+   string candidate_trimmed=TrimString(candidate_symbol);
+   string target_trimmed=TrimString(target_symbol);
+   if(candidate_trimmed=="" || target_trimmed=="")
+      return -1;
+
+   string candidate_upper=ToUpperAscii(candidate_trimmed);
+   string target_upper=ToUpperAscii(target_trimmed);
+   if(candidate_upper==target_upper)
+      return 3000;
+
+   string candidate_normalized=NormalizeSymbolKey(candidate_trimmed);
+   string target_normalized=NormalizeSymbolKey(target_trimmed);
+   if(candidate_normalized!="" && candidate_normalized==target_normalized)
+      return 2500;
+
+   string candidate_compact=CompactSymbolKey(candidate_trimmed);
+   string target_compact=CompactSymbolKey(target_trimmed);
+   if(candidate_compact=="" || target_compact=="")
+      return -1;
+
+   if(candidate_compact==target_compact)
+      return 2400;
+
+   int contained_score=ContainedSymbolScore(candidate_compact,target_compact);
+   if(contained_score>=0)
+      return 2000+contained_score;
+
+   contained_score=ContainedSymbolScore(target_compact,candidate_compact);
+   if(contained_score>=0)
+      return 2000+contained_score;
+
+   return -1;
   }
 
 bool StartsWithText(const string value,const string prefix)
@@ -917,7 +1024,129 @@ string NormalizeSymbolKey(const string symbol)
 
 bool SymbolsEquivalent(const string left,const string right)
   {
-   return NormalizeSymbolKey(left)==NormalizeSymbolKey(right);
+   return GetSymbolSimilarityScore(left,right)>=2000;
+  }
+
+void AddUniqueText(string &values[],const string value)
+  {
+   string trimmed=TrimString(value);
+   if(trimmed=="")
+      return;
+
+   for(int i=0;i<ArraySize(values);i++)
+     {
+      if(StringsEqualIgnoreCase(values[i],trimmed))
+         return;
+     }
+
+   int size=ArraySize(values);
+   ArrayResize(values,size+1);
+   values[size]=trimmed;
+  }
+
+string GetCachedSlaveSymbol(const string master_symbol)
+  {
+   for(int i=0;i<ArraySize(g_symbol_resolution_cache);i++)
+     {
+      if(StringsEqualIgnoreCase(g_symbol_resolution_cache[i].master_symbol,master_symbol) ||
+         SymbolsEquivalent(g_symbol_resolution_cache[i].master_symbol,master_symbol))
+         return g_symbol_resolution_cache[i].slave_symbol;
+     }
+   return "";
+  }
+
+void CacheSlaveSymbol(const string master_symbol,const string slave_symbol)
+  {
+   if(TrimString(master_symbol)=="" || TrimString(slave_symbol)=="")
+      return;
+
+   for(int i=0;i<ArraySize(g_symbol_resolution_cache);i++)
+     {
+      if(StringsEqualIgnoreCase(g_symbol_resolution_cache[i].master_symbol,master_symbol) ||
+         SymbolsEquivalent(g_symbol_resolution_cache[i].master_symbol,master_symbol))
+        {
+         g_symbol_resolution_cache[i].master_symbol=master_symbol;
+         g_symbol_resolution_cache[i].slave_symbol=slave_symbol;
+         return;
+        }
+     }
+
+   int size=ArraySize(g_symbol_resolution_cache);
+   ArrayResize(g_symbol_resolution_cache,size+1);
+   g_symbol_resolution_cache[size].master_symbol=master_symbol;
+   g_symbol_resolution_cache[size].slave_symbol=slave_symbol;
+  }
+
+void BuildSymbolLookupCandidates(const string master_symbol,const string template_symbol,string &candidates[])
+  {
+   ArrayResize(candidates,0);
+   AddUniqueText(candidates,template_symbol);
+   AddUniqueText(candidates,NormalizeSymbolKey(template_symbol));
+   AddUniqueText(candidates,master_symbol);
+   AddUniqueText(candidates,NormalizeSymbolKey(master_symbol));
+   AddUniqueText(candidates,CompactSymbolKey(template_symbol));
+   AddUniqueText(candidates,CompactSymbolKey(master_symbol));
+  }
+
+bool ParseCopyOnlySymbols()
+  {
+   ArrayResize(g_symbol_filters,0);
+
+   string filter_text=TrimString(CopyOnlySymbols);
+   if(filter_text=="")
+      return true;
+
+   string normalized=ReplaceString(filter_text,",",";");
+   string items[];
+   int item_count=StringSplit(normalized,';',items);
+   if(item_count<=0)
+      return false;
+
+   for(int i=0;i<item_count;i++)
+     {
+      string value=TrimString(items[i]);
+      if(value=="")
+         continue;
+
+      int size=ArraySize(g_symbol_filters);
+      ArrayResize(g_symbol_filters,size+1);
+      g_symbol_filters[size].value=value;
+     }
+
+   return ArraySize(g_symbol_filters)>0;
+  }
+
+bool HasSymbolCopyFilter()
+  {
+   return ArraySize(g_symbol_filters)>0;
+  }
+
+bool SymbolMatchesCopyFilter(const string symbol)
+  {
+   if(!HasSymbolCopyFilter())
+      return true;
+
+   for(int i=0;i<ArraySize(g_symbol_filters);i++)
+     {
+      if(GetSymbolSimilarityScore(symbol,g_symbol_filters[i].value)>=2000)
+         return true;
+     }
+
+   return false;
+  }
+
+bool IsSymbolAllowedForCopy(const string master_symbol,const string slave_symbol="")
+  {
+   if(!HasSymbolCopyFilter())
+      return true;
+
+   if(SymbolMatchesCopyFilter(master_symbol))
+      return true;
+
+   if(slave_symbol!="" && SymbolMatchesCopyFilter(slave_symbol))
+      return true;
+
+   return false;
   }
 
 uint HashString32(const string value)
@@ -1241,7 +1470,7 @@ void LoadRedisHttpExportConfig(RedisHttpExportConfig &config)
    config.verbose_logs=VerboseLogs;
    config.log_prefix="FXTradeCopper";
    config.ea_name="FX Trade Copper";
-   config.ea_version="3.10";
+   config.ea_version="3.12";
    config.mode_name=(Mode==MODE_MASTER) ? "MASTER" : "SLAVE";
    config.channel_id=g_channel_key;
    config.copy_positions=CopyPositions;
@@ -1379,9 +1608,11 @@ string BuildTransportFileName()
 bool ParseSymbolMappings()
   {
    ArrayResize(g_symbol_maps,0);
+   ArrayResize(g_symbol_resolution_cache,0);
    string mapping_text=TrimString(SymbolMappings);
    if(mapping_text=="")
-      mapping_text="XAUUSD=XAUUSD";
+      return AutoMapByBaseSymbol;
+
    string map_items[];
    int mapping_count=StringSplit(mapping_text,';',map_items);
    if(mapping_count<=0)
@@ -1408,7 +1639,7 @@ bool ParseSymbolMappings()
       g_symbol_maps[size].slave_symbol=slave_symbol;
      }
 
-   return ArraySize(g_symbol_maps)>0;
+   return ArraySize(g_symbol_maps)>0 || AutoMapByBaseSymbol;
   }
 
 string GetMappedSlaveSymbolTemplate(const string master_symbol)
@@ -1441,37 +1672,56 @@ string ResolveBrokerSymbol(const string symbol_template)
    if(!AutoMapByBaseSymbol)
       return "";
 
-   string target_key=NormalizeSymbolKey(symbol_template);
+   string best_candidate="";
+   int best_score=-1;
    int total=SymbolsTotal(false);
    for(int i=0;i<total;i++)
      {
       string candidate=SymbolName(i,false);
-      if(SymbolsEquivalent(candidate,target_key))
+      int candidate_score=GetSymbolSimilarityScore(candidate,symbol_template);
+      if(candidate_score>best_score)
         {
-         if(SymbolSelect(candidate,true))
-            return candidate;
-         return candidate;
+         best_score=candidate_score;
+         best_candidate=candidate;
         }
      }
-   return "";
+
+   if(best_score<2000)
+      return "";
+
+   if(SymbolSelect(best_candidate,true))
+      return best_candidate;
+   return best_candidate;
   }
 
 string FindSlaveSymbol(const string master_symbol)
   {
+   string cached_symbol=GetCachedSlaveSymbol(master_symbol);
+   if(cached_symbol!="")
+      return cached_symbol;
+
    string template_symbol=GetMappedSlaveSymbolTemplate(master_symbol);
-   string resolved=ResolveBrokerSymbol(template_symbol);
-   if(resolved!="")
-      return resolved;
+   string candidates[];
+   BuildSymbolLookupCandidates(master_symbol,template_symbol,candidates);
 
-   if(AutoMapByBaseSymbol)
+   for(int i=0;i<ArraySize(candidates);i++)
      {
-      resolved=ResolveBrokerSymbol(NormalizeSymbolKey(template_symbol));
+      string resolved=ResolveBrokerSymbol(candidates[i]);
       if(resolved!="")
+        {
+         CacheSlaveSymbol(master_symbol,resolved);
+         if(VerboseLogs && !StringsEqualIgnoreCase(resolved,master_symbol))
+           {
+            string source_hint=(StringsEqualIgnoreCase(candidates[i],template_symbol) && template_symbol!="")
+                               ? StringFormat("template %s",template_symbol)
+                               : StringFormat("alias %s",candidates[i]);
+            LogMessage(StringFormat("Auto-detected slave symbol %s for master symbol %s using %s.",
+                                    resolved,
+                                    master_symbol,
+                                    source_hint));
+           }
          return resolved;
-
-      resolved=ResolveBrokerSymbol(NormalizeSymbolKey(master_symbol));
-      if(resolved!="")
-         return resolved;
+        }
      }
 
    return "";
@@ -1479,19 +1729,25 @@ string FindSlaveSymbol(const string master_symbol)
 
 bool IsMappedMasterSymbol(const string symbol)
   {
+   if(!IsSymbolAllowedForCopy(symbol))
+      return false;
    return GetMappedSlaveSymbolTemplate(symbol)!="";
   }
 
 bool IsMappedSlaveSymbol(const string symbol)
   {
+   if(!IsSymbolAllowedForCopy(symbol))
+      return false;
+
    for(int i=0;i<ArraySize(g_symbol_maps);i++)
      {
       if(g_symbol_maps[i].slave_symbol==symbol)
          return true;
       if(AutoMapByBaseSymbol && SymbolsEquivalent(g_symbol_maps[i].slave_symbol,symbol))
          return true;
-      }
-   return false;
+     }
+
+   return AutoMapByBaseSymbol;
   }
 
 string LongToText(const long value)
@@ -1833,8 +2089,12 @@ bool LoadRemotePositions(const string blob,RemotePosition &positions[],bool &all
          continue;
 
       string slave_symbol=FindSlaveSymbol(columns[1]);
+      if(slave_symbol!="" && !IsSymbolAllowedForCopy(columns[1],slave_symbol))
+         continue;
       if(slave_symbol=="")
         {
+         if(!IsSymbolAllowedForCopy(columns[1]))
+            continue;
          all_symbols_resolved=false;
          LogMessage(StringFormat("Could not resolve slave symbol for master symbol %s",columns[1]));
          continue;
@@ -1870,8 +2130,12 @@ bool LoadRemoteOrders(const string blob,RemoteOrder &orders[],bool &all_symbols_
          continue;
 
       string slave_symbol=FindSlaveSymbol(columns[1]);
+      if(slave_symbol!="" && !IsSymbolAllowedForCopy(columns[1],slave_symbol))
+         continue;
       if(slave_symbol=="")
         {
+         if(!IsSymbolAllowedForCopy(columns[1]))
+            continue;
          all_symbols_resolved=false;
          LogMessage(StringFormat("Could not resolve slave pending-order symbol for master symbol %s",columns[1]));
          continue;
@@ -1975,8 +2239,6 @@ void CleanupMissingSlavePositions(const long &active_master_tickets[])
          continue;
       if(PositionGetInteger(POSITION_MAGIC)!=MagicNumber)
          continue;
-      if(!IsMappedSlaveSymbol(PositionGetString(POSITION_SYMBOL)))
-         continue;
 
       string comment=PositionGetString(POSITION_COMMENT);
       if(!IsCopiedCommentForChannel(comment) || ExtractEntityTypeFromComment(comment)!="P")
@@ -1999,8 +2261,6 @@ void CleanupMissingSlaveOrders(const long &active_master_tickets[])
       if(ticket==0 || !OrderSelect(ticket))
          continue;
       if(OrderGetInteger(ORDER_MAGIC)!=MagicNumber)
-         continue;
-      if(!IsMappedSlaveSymbol(OrderGetString(ORDER_SYMBOL)))
          continue;
 
       string comment=OrderGetString(ORDER_COMMENT);
@@ -2186,6 +2446,8 @@ int OnInit()
 
    if(!ParseSymbolMappings())
       return INIT_PARAMETERS_INCORRECT;
+   if(!ParseCopyOnlySymbols())
+      return INIT_PARAMETERS_INCORRECT;
    if(!ParseScheduleRules())
       return INIT_PARAMETERS_INCORRECT;
    RedisHttpExportConfig redis_export_config;
@@ -2204,6 +2466,8 @@ int OnInit()
       string schedule_reason="";
       SlaveCopyAllowedBySchedule(schedule_reason);
       ResolveTimeBasedLotMultiplier();
+      if(TrimString(SymbolMappings)=="")
+         LogMessage("SymbolMappings is blank. Auto broker symbol detection is active, so common suffix and prefix symbols such as XAUUSD.m, XAUUSDm, or mXAUUSD can be matched automatically.");
       if(!EnableSlaveTimeSchedule)
         {
          LogMessage("Slave copy schedule is OFF. Enable EnableSlaveTimeSchedule to use weekday and copy-stop filters.");
@@ -2211,10 +2475,12 @@ int OnInit()
             LogMessage("Lot multiplier scheduling is still active because a lot window or lot rule is configured.");
         }
      }
-   LogMessage(StringFormat("Initialized. mode=%s channel=%s mappings=%d file=%s",
+   LogMessage(StringFormat("Initialized. mode=%s channel=%s mappings=%d symbol_filter=%d auto_map=%s file=%s",
                            Mode==MODE_MASTER ? "MASTER" : "SLAVE",
                            g_channel_key,
                            ArraySize(g_symbol_maps),
+                           ArraySize(g_symbol_filters),
+                           AutoMapByBaseSymbol ? "true" : "false",
                            g_transport_file_name));
    LogMessage("EA-only sync enabled. One master can feed multiple slave accounts through the shared common file.");
    return INIT_SUCCEEDED;

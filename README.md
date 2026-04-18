@@ -31,6 +31,12 @@ This project now has a modular Redis export system:
   A Redis-only exporter EA for accounts where you want analytics and history export without trade copying
 - [fx_trade_copper_redis_module.mqh](./fx_trade_copper_redis_module.mqh)
   The shared Redis HTTP module used by both EAs
+- [redis_http_proxy](./redis_http_proxy)
+  A reusable Node.js Fastify proxy that receives MT5 payloads and stores latest state plus history in Redis
+- [docs/redis-http-proxy-setup.md](./docs/redis-http-proxy-setup.md)
+  Step-by-step local setup guide for the proxy, Redis, and MT5 WebRequest configuration
+- [docs/redis-vps-setup.md](./docs/redis-vps-setup.md)
+  VPS deployment guide for same-host Redis, split-host Redis, and managed Redis setups
 
 This makes the Redis system easier to maintain, test, and reuse across future EAs.
 
@@ -60,6 +66,7 @@ That design gives you:
 - easier scaling
 - easier integration with web and mobile apps
 - freedom to use Redis as cache, event store, analytics store, or API source
+- one reusable proxy for local PC, local VPS, or remote VPS deployments
 
 ### Exported data
 
@@ -92,7 +99,8 @@ When Redis export is enabled, the EA can send:
 ### Mapping and sizing features
 
 - manual symbol mapping with `SymbolMappings`
-- automatic base-symbol matching with `AutoMapByBaseSymbol`
+- automatic broker symbol matching with `AutoMapByBaseSymbol`, including common prefix and suffix variants
+- optional `CopyOnlySymbols` filter to copy only selected symbols
 - base lot scaling with `VolumeMultiplier`
 - time-based lot multiplier window
 - advanced lot multiplier rules
@@ -125,7 +133,8 @@ When Redis export is enabled, the EA can send:
 | --- | --- |
 | `Mode` | `MODE_MASTER` or `MODE_SLAVE` |
 | `ChannelId` | Shared channel name used by master and slave |
-| `SymbolMappings` | Manual symbol map, for example `XAUUSD=XAUUSDm;EURUSD=EURUSDm` |
+| `SymbolMappings` | Optional manual symbol map, for example `XAUUSD=XAUUSDm;EURUSD=EURUSDm`. Default is blank so the EA can auto-detect common broker suffix and prefix variants such as `XAUUSD.m`, `XAUUSDm`, `.cr`, or `mXAUUSD`. |
+| `CopyOnlySymbols` | Optional allow-list of symbols to copy, for example `XAUUSD;EURUSD;US30`. Matches master or slave broker symbols. Leave blank to copy all symbols. |
 | `MagicNumber` | Magic number used for copied slave trades |
 | `VolumeMultiplier` | Base multiplier for copied lot size |
 | `TimerIntervalMs` | Timer frequency for copier polling |
@@ -249,7 +258,7 @@ Supported syntax:
 - attach `fx_trade_copper`
 - set `Mode=MODE_SLAVE`
 - use the same `ChannelId`
-- set slave symbol mappings
+- leave `SymbolMappings` blank for normal suffix or prefix brokers, or set it only when your broker uses truly different names
 - configure lot sizing and schedule rules if needed
 
 ### 3. Enable trading on the slave
@@ -350,6 +359,15 @@ RedisHttpUseBearerToken=false
 - store payloads in Redis under account and channel keys
 - optionally persist trade history to PostgreSQL or another database for long-term reporting
 
+### 5. Use the bundled Redis proxy
+
+This repository now includes a ready-to-run Redis HTTP proxy in [redis_http_proxy](./redis_http_proxy).
+
+Use these guides:
+
+- local and Docker setup: [docs/redis-http-proxy-setup.md](./docs/redis-http-proxy-setup.md)
+- VPS and hosted Redis setup: [docs/redis-vps-setup.md](./docs/redis-vps-setup.md)
+
 ## Example API Contract
 
 The EA sends a `POST` request to:
@@ -416,14 +434,22 @@ Suggested request body fields:
 
 ## Suggested Redis Key Design
 
-Your API can store data in Redis any way you like. A practical pattern is:
+The bundled proxy stores Redis data in a hybrid layout with latest-state keys and history structures.
+
+Practical examples:
 
 ```text
-mt5:account:<login>:snapshot
+mt5:account:<login>:summary
+mt5:account:<login>:terminal
+mt5:account:<login>:copy_settings
 mt5:account:<login>:pnl
 mt5:account:<login>:positions
 mt5:account:<login>:orders
-mt5:account:<login>:history
+mt5:account:<login>:trade_history:latest
+mt5:account:<login>:events
+mt5:account:<login>:history:snapshots
+mt5:account:<login>:history:deals:index
+mt5:account:<login>:history:deals:by_ticket
 mt5:channel:<channel_id>:accounts
 ```
 
@@ -548,7 +574,7 @@ If MT5 terminal deployment fails because of Windows file permissions, the build 
 
 ## Version
 
-Current EA version: `3.10`
+Current EA version: `3.12`
 
 ## MQL5 References
 
