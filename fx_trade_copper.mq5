@@ -10,6 +10,12 @@
 
 #define PROTOCOL_VERSION "2"
 #define COMMENT_PREFIX "TC"
+#define TELEGRAM_COMMENT_PREFIX "t.me/fx_bot_master"
+#define BRANDED_COMMENT_PREFIX "fx_bot_master"
+#define COMPACT_COMMENT_PREFIX "FXC"
+#define MAX_TRADE_COMMENT_LENGTH 31
+#define COMMENT_CHANNEL_TAG_LENGTH 4
+#define LEGACY_COMMENT_CHANNEL_TAG_LENGTH 6
 #define EMPTY_BLOB "-"
 
 #include "fx_trade_copper_redis_module.mqh"
@@ -651,6 +657,112 @@ int GetSymbolSimilarityScore(const string candidate_symbol,const string target_s
       return 2000+contained_score;
 
    return -1;
+  }
+
+int GetSymbolCompactExtraLength(const string candidate_symbol,const string target_symbol)
+  {
+   string candidate_compact=CompactSymbolKey(candidate_symbol);
+   string target_compact=CompactSymbolKey(target_symbol);
+   if(candidate_compact=="" || target_compact=="")
+      return 1000;
+   if(candidate_compact==target_compact)
+      return 0;
+
+   int index=StringFind(candidate_compact,target_compact,0);
+   if(index>=0)
+      return StringLen(candidate_compact)-StringLen(target_compact);
+
+   index=StringFind(target_compact,candidate_compact,0);
+   if(index>=0)
+      return StringLen(target_compact)-StringLen(candidate_compact);
+
+   return (int)MathAbs(StringLen(candidate_compact)-StringLen(target_compact))+100;
+  }
+
+int GetSymbolDecorationPenalty(const string candidate_symbol,const string target_symbol)
+  {
+   string candidate_trimmed=TrimString(candidate_symbol);
+   string target_trimmed=TrimString(target_symbol);
+   int penalty=(int)MathAbs(StringLen(candidate_trimmed)-StringLen(target_trimmed))*10;
+   penalty+=GetSymbolCompactExtraLength(candidate_trimmed,target_trimmed)*100;
+
+   int length=StringLen(candidate_trimmed);
+   for(int i=0;i<length;i++)
+     {
+      int ch=StringGetCharacter(candidate_trimmed,i);
+      if(!IsAsciiLetterOrDigit(ch))
+         penalty+=5;
+      if(ch=='.')
+         penalty+=20;
+     }
+
+   return penalty;
+  }
+
+int GetSymbolTradePreferenceScore(const string symbol)
+  {
+   int score=0;
+   ENUM_SYMBOL_TRADE_MODE trade_mode=(ENUM_SYMBOL_TRADE_MODE)SymbolInfoInteger(symbol,SYMBOL_TRADE_MODE);
+   switch(trade_mode)
+     {
+      case SYMBOL_TRADE_MODE_FULL:
+         score+=400;
+         break;
+      case SYMBOL_TRADE_MODE_LONGONLY:
+      case SYMBOL_TRADE_MODE_SHORTONLY:
+         score+=250;
+         break;
+      case SYMBOL_TRADE_MODE_CLOSEONLY:
+         score+=50;
+         break;
+      case SYMBOL_TRADE_MODE_DISABLED:
+      default:
+         score-=400;
+         break;
+     }
+
+   if((bool)SymbolInfoInteger(symbol,SYMBOL_SELECT))
+      score+=200;
+   if((bool)SymbolInfoInteger(symbol,SYMBOL_VISIBLE))
+      score+=100;
+   if((bool)SymbolInfoInteger(symbol,SYMBOL_CUSTOM))
+      score-=300;
+
+   return score;
+  }
+
+bool IsBetterBrokerSymbolCandidate(const string candidate_symbol,
+                                   const string best_symbol,
+                                   const string symbol_template,
+                                   const int candidate_score,
+                                   const int best_score)
+  {
+   if(best_symbol=="" || best_score<0)
+      return true;
+
+   int candidate_trade_score=GetSymbolTradePreferenceScore(candidate_symbol);
+   int best_trade_score=GetSymbolTradePreferenceScore(best_symbol);
+   int candidate_penalty=GetSymbolDecorationPenalty(candidate_symbol,symbol_template);
+   int best_penalty=GetSymbolDecorationPenalty(best_symbol,symbol_template);
+
+   bool candidate_strong_match=(candidate_score>=2400);
+   bool best_strong_match=(best_score>=2400);
+   if(candidate_strong_match && best_strong_match)
+     {
+      if(candidate_trade_score!=best_trade_score)
+         return candidate_trade_score>best_trade_score;
+      if(candidate_penalty!=best_penalty)
+         return candidate_penalty<best_penalty;
+     }
+
+   if(candidate_score!=best_score)
+      return candidate_score>best_score;
+   if(candidate_trade_score!=best_trade_score)
+      return candidate_trade_score>best_trade_score;
+   if(candidate_penalty!=best_penalty)
+      return candidate_penalty<best_penalty;
+
+   return StringLen(TrimString(candidate_symbol))<StringLen(TrimString(best_symbol));
   }
 
 bool StartsWithText(const string value,const string prefix)
@@ -1661,25 +1773,21 @@ string GetMappedSlaveSymbolTemplate(const string master_symbol)
    return "";
   }
 
-string ResolveBrokerSymbol(const string symbol_template)
+string ResolveBrokerSymbolFromPool(const string symbol_template,const bool selected_only)
   {
    if(symbol_template=="")
       return "";
 
-   if(SymbolSelect(symbol_template,true))
-      return symbol_template;
-
-   if(!AutoMapByBaseSymbol)
-      return "";
-
    string best_candidate="";
    int best_score=-1;
-   int total=SymbolsTotal(false);
+   int total=SymbolsTotal(selected_only);
    for(int i=0;i<total;i++)
      {
-      string candidate=SymbolName(i,false);
+      string candidate=SymbolName(i,selected_only);
       int candidate_score=GetSymbolSimilarityScore(candidate,symbol_template);
-      if(candidate_score>best_score)
+      if(candidate_score<2000)
+         continue;
+      if(IsBetterBrokerSymbolCandidate(candidate,best_candidate,symbol_template,candidate_score,best_score))
         {
          best_score=candidate_score;
          best_candidate=candidate;
@@ -1692,6 +1800,24 @@ string ResolveBrokerSymbol(const string symbol_template)
    if(SymbolSelect(best_candidate,true))
       return best_candidate;
    return best_candidate;
+  }
+
+string ResolveBrokerSymbol(const string symbol_template)
+  {
+   if(symbol_template=="")
+      return "";
+
+   if(SymbolSelect(symbol_template,true))
+      return symbol_template;
+
+   if(!AutoMapByBaseSymbol)
+      return "";
+
+   string resolved=ResolveBrokerSymbolFromPool(symbol_template,true);
+   if(resolved!="")
+      return resolved;
+
+   return ResolveBrokerSymbolFromPool(symbol_template,false);
   }
 
 string FindSlaveSymbol(const string master_symbol)
@@ -1841,33 +1967,173 @@ bool OrderTypeIsPending(const ENUM_ORDER_TYPE order_type)
 
 string BuildEntityComment(const string entity_type,const long master_ticket)
   {
-   return StringFormat("%s|%s|%s|%s",COMMENT_PREFIX,ChannelTag(),entity_type,LongToText(master_ticket));
+   string ticket_token=EncodeTicketToken(master_ticket);
+   string channel_token=ShortChannelTag();
+   string preferred=StringFormat("%s|%s%s%s",TELEGRAM_COMMENT_PREFIX,entity_type,channel_token,ticket_token);
+   if(StringLen(preferred)<=MAX_TRADE_COMMENT_LENGTH)
+      return preferred;
+   return StringFormat("%s|%s|%s|%s",COMPACT_COMMENT_PREFIX,LegacyShortChannelTag(),entity_type,ticket_token);
+  }
+
+string ChannelTagWithLength(const int length)
+  {
+   string channel_tag=ChannelTag();
+   if(StringLen(channel_tag)<=length)
+      return channel_tag;
+   return StringSubstr(channel_tag,0,length);
+  }
+
+string ShortChannelTag()
+  {
+   return ChannelTagWithLength(COMMENT_CHANNEL_TAG_LENGTH);
+  }
+
+string LegacyShortChannelTag()
+  {
+   return ChannelTagWithLength(LEGACY_COMMENT_CHANNEL_TAG_LENGTH);
+  }
+
+int EncodedDigitValue(const int ch)
+  {
+   if(ch>='0' && ch<='9')
+      return ch-'0';
+   if(ch>='A' && ch<='Z')
+      return ch-'A'+10;
+   if(ch>='a' && ch<='z')
+      return ch-'a'+36;
+   return -1;
+  }
+
+string EncodedDigitText(const int digit)
+  {
+   if(digit<10)
+      return CharToString((uchar)('0'+digit));
+   if(digit<36)
+      return CharToString((uchar)('A'+digit-10));
+   return CharToString((uchar)('a'+digit-36));
+  }
+
+string EncodeTicketToken(const long master_ticket)
+  {
+   ulong value=(master_ticket<0) ? 0 : (ulong)master_ticket;
+   if(value==0)
+      return "0";
+
+   string token="";
+   while(value>0)
+     {
+      int digit=(int)(value%62);
+      token=EncodedDigitText(digit)+token;
+      value/=62;
+     }
+   return token;
+  }
+
+bool DecodeTicketToken(const string token,long &master_ticket)
+  {
+   master_ticket=-1;
+   string normalized=TrimString(token);
+   if(normalized=="")
+      return false;
+
+   ulong value=0;
+   for(int i=0;i<StringLen(normalized);i++)
+     {
+      int digit=EncodedDigitValue(StringGetCharacter(normalized,i));
+      if(digit<0)
+         return false;
+      value=(value*62)+(ulong)digit;
+     }
+
+   master_ticket=(long)value;
+   return master_ticket>=0;
+  }
+
+bool ParseCopiedCommentForChannel(const string comment,string &entity_type,long &master_ticket)
+  {
+   entity_type="";
+   master_ticket=-1;
+
+   string trimmed=TrimString(comment);
+   if(trimmed=="")
+      return false;
+
+   string telegram_prefix=StringFormat("%s|",TELEGRAM_COMMENT_PREFIX);
+   if(StringFind(trimmed,telegram_prefix,0)==0)
+     {
+      string payload=StringSubstr(trimmed,StringLen(telegram_prefix));
+      if(StringLen(payload)<1+COMMENT_CHANNEL_TAG_LENGTH+1)
+         return false;
+
+      entity_type=StringSubstr(payload,0,1);
+      string channel_token=StringSubstr(payload,1,COMMENT_CHANNEL_TAG_LENGTH);
+      string ticket_token=StringSubstr(payload,1+COMMENT_CHANNEL_TAG_LENGTH);
+      if(ToUpperAscii(channel_token)!=ToUpperAscii(ShortChannelTag()))
+         return false;
+      return entity_type!="" && DecodeTicketToken(ticket_token,master_ticket);
+     }
+
+   string parts[];
+   if(StringSplit(trimmed,'|',parts)<4)
+      return false;
+
+   string prefix=TrimString(parts[0]);
+   if(prefix==COMMENT_PREFIX)
+     {
+      // Legacy format: TC|<full channel tag>|<entity>|<master ticket>
+      if(ToUpperAscii(TrimString(parts[1]))!=ToUpperAscii(ChannelTag()))
+         return false;
+      entity_type=TrimString(parts[2]);
+      master_ticket=StringToInteger(TrimString(parts[3]));
+      return entity_type!="" && master_ticket>=0;
+     }
+
+   if(prefix==BRANDED_COMMENT_PREFIX)
+     {
+      string channel_token=TrimString(parts[2]);
+      if(ToUpperAscii(channel_token)!=ToUpperAscii(ShortChannelTag()) &&
+         ToUpperAscii(channel_token)!=ToUpperAscii(LegacyShortChannelTag()))
+         return false;
+      entity_type=TrimString(parts[1]);
+      return entity_type!="" && DecodeTicketToken(parts[3],master_ticket);
+     }
+
+   if(prefix==COMPACT_COMMENT_PREFIX)
+     {
+      string channel_token=TrimString(parts[1]);
+      if(ToUpperAscii(channel_token)!=ToUpperAscii(ShortChannelTag()) &&
+         ToUpperAscii(channel_token)!=ToUpperAscii(LegacyShortChannelTag()))
+         return false;
+      entity_type=TrimString(parts[2]);
+      return entity_type!="" && DecodeTicketToken(parts[3],master_ticket);
+     }
+
+   return false;
   }
 
 bool IsCopiedCommentForChannel(const string comment)
   {
-   string prefix=StringFormat("%s|%s|",COMMENT_PREFIX,ChannelTag());
-   return StringFind(comment,prefix,0)==0;
+   string entity_type="";
+   long master_ticket=-1;
+   return ParseCopiedCommentForChannel(comment,entity_type,master_ticket);
   }
 
 string ExtractEntityTypeFromComment(const string comment)
   {
-   if(!IsCopiedCommentForChannel(comment))
+   string entity_type="";
+   long master_ticket=-1;
+   if(!ParseCopiedCommentForChannel(comment,entity_type,master_ticket))
       return "";
-   string parts[];
-   if(StringSplit(comment,'|',parts)<4)
-      return "";
-   return parts[2];
+   return entity_type;
   }
 
 long ExtractMasterTicketFromComment(const string comment)
   {
-   if(!IsCopiedCommentForChannel(comment))
+   string entity_type="";
+   long master_ticket=-1;
+   if(!ParseCopiedCommentForChannel(comment,entity_type,master_ticket))
       return -1;
-   string parts[];
-   if(StringSplit(comment,'|',parts)<4)
-      return -1;
-   return StringToInteger(parts[3]);
+   return master_ticket;
   }
 
 bool ContainsMasterTicket(const long &tickets[],const long ticket)
@@ -1917,7 +2183,7 @@ string DecodeBlob(const string blob)
    return (blob==EMPTY_BLOB) ? "" : blob;
   }
 
-ulong FindSlavePositionTicket(const string symbol,const string comment)
+ulong FindSlavePositionTicket(const string symbol,const long master_ticket)
   {
    for(int i=0;i<PositionsTotal();i++)
      {
@@ -1928,14 +2194,18 @@ ulong FindSlavePositionTicket(const string symbol,const string comment)
          continue;
       if(PositionGetString(POSITION_SYMBOL)!=symbol)
          continue;
-      if(PositionGetString(POSITION_COMMENT)!=comment)
+      string entity_type="";
+      long parsed_master_ticket=-1;
+      if(!ParseCopiedCommentForChannel(PositionGetString(POSITION_COMMENT),entity_type,parsed_master_ticket))
+         continue;
+      if(entity_type!="P" || parsed_master_ticket!=master_ticket)
          continue;
       return ticket;
      }
    return 0;
   }
 
-ulong FindSlaveOrderTicket(const string symbol,const string comment)
+ulong FindSlaveOrderTicket(const string symbol,const long master_ticket)
   {
    for(int i=0;i<OrdersTotal();i++)
      {
@@ -1946,7 +2216,11 @@ ulong FindSlaveOrderTicket(const string symbol,const string comment)
          continue;
       if(OrderGetString(ORDER_SYMBOL)!=symbol)
          continue;
-      if(OrderGetString(ORDER_COMMENT)!=comment)
+      string entity_type="";
+      long parsed_master_ticket=-1;
+      if(!ParseCopiedCommentForChannel(OrderGetString(ORDER_COMMENT),entity_type,parsed_master_ticket))
+         continue;
+      if(entity_type!="O" || parsed_master_ticket!=master_ticket)
          continue;
       return ticket;
      }
@@ -2164,7 +2438,7 @@ bool LoadRemoteOrders(const string blob,RemoteOrder &orders[],bool &all_symbols_
 bool EnsurePositionMatches(const RemotePosition &remote)
   {
    string comment=BuildEntityComment("P",remote.master_ticket);
-   ulong ticket=FindSlavePositionTicket(remote.slave_symbol,comment);
+   ulong ticket=FindSlavePositionTicket(remote.slave_symbol,remote.master_ticket);
    double target_volume=NormalizeVolumeForSymbol(remote.slave_symbol,remote.volume);
 
    if(ticket!=0 && PositionSelectByTicket(ticket))
@@ -2197,7 +2471,7 @@ bool EnsurePositionMatches(const RemotePosition &remote)
 bool EnsureOrderMatches(const RemoteOrder &remote)
   {
    string comment=BuildEntityComment("O",remote.master_ticket);
-   ulong ticket=FindSlaveOrderTicket(remote.slave_symbol,comment);
+   ulong ticket=FindSlaveOrderTicket(remote.slave_symbol,remote.master_ticket);
    double target_volume=NormalizeVolumeForSymbol(remote.slave_symbol,remote.volume);
 
    if(ticket!=0 && OrderSelect(ticket))
